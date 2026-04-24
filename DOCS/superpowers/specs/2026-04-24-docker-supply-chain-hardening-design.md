@@ -2,7 +2,8 @@
 
 - Date: 2026-04-24
 - Driving issue: [#498](https://github.com/billchurch/webssh2/issues/498)
-- Status: Approved; implementation plan to follow
+- Status: Approved after red-team review (see
+  `2026-04-24-docker-supply-chain-hardening-red-team.md`)
 
 ## Context
 
@@ -23,6 +24,9 @@ Root causes:
    the built container image. Base-image CVEs never surface in CI.
 4. `docker-publish.yml` has no image-scan gate. A compromised or regressed
    upstream digest could be published without detection.
+5. `main` branch protection has no required status checks, no required
+   reviews, and allows force-pushes; repo-level `allow_auto_merge` is off.
+   Any "auto-merge is safe" story has to start by fixing the repo posture.
 
 ## Goals
 
@@ -32,15 +36,46 @@ Root causes:
 3. Gate every rebuild with image-level vulnerability scanning so regressions
    in upstream digests never reach consumers.
 4. Preserve immutability of `sha-<commit>` tags.
+5. Harden repo-level branch protection so the auto-merge pipeline has
+   required, enforceable gates.
 
 ## Non-Goals
 
 - Rebuilding release tag series older than the latest one.
-- Scheduled "safety-net" rebuilds on top of the event-driven flow.
 - Migrating Docker Hub publishing to OIDC (tracked separately; Docker Hub
   OIDC support is still limited).
-- Updating `examples/Dockerfile` — it is a documentation sample, not
-  published.
+- Updating `examples/Dockerfile` beyond a documentation-level reminder to
+  pin by digest (it is a sample, not a published image).
+- Auto-reverting merged Renovate commits on post-merge scan failure (nice
+  to have, but deferred).
+
+## Accepted Risks
+
+Documenting risks we are knowingly accepting, to make re-evaluation easy
+when they materialize:
+
+1. **Renovate as a single point of failure for CVE patching.** If the
+   Renovate GitHub App is paused, uninstalled, rate-limited, or
+   misconfigured, base-image CVEs do not land. We accept this rather than
+   building a parallel scheduled rebuild, on the premise that: (a)
+   Renovate outages are rare and publicly visible, (b) the repo's
+   Dependency graph will continue to surface CVEs through GitHub's
+   native advisories, (c) we can trigger a rebuild manually via
+   `workflow_dispatch` on `docker-publish.yml` within minutes. If
+   Renovate misses a CVE in practice, revisit A3 in the red-team
+   review and add a scheduled drift-check workflow.
+2. **Upstream `node:22-alpine` manifest disappearance** breaks builds
+   until Renovate opens a new PR or a human overrides the digest. Same
+   mitigation as above: manual dispatch is available.
+3. **`docker-publish.yml` test-after-push ordering** (existing defect,
+   A4 in the red-team review) is addressed as part of PR 2 since that PR
+   already restructures the workflow. Not tracked as a separate risk.
+
+## Notation
+
+`<pinned-sha>` appearing in workflow snippets below is a placeholder. The
+implementation plan resolves each one to a full 40-character commit SHA
+for the named upstream action, per the project's supply-chain policy.
 
 ## Architecture
 
@@ -49,44 +84,126 @@ Upstream node:22-alpine digest changes
             │
             ▼
     Renovate bot opens PR
-  (digest-only update, grouped separately from version bumps)
+  (digest-only; forbidden from grouping with version bumps;
+   matchDepNames: ['node'], matchCurrentValue: '22-alpine')
             │
             ▼
-   ci.yml path-filtered Dockerfile job:
-   docker buildx build --load (amd64) → Trivy image scan
+   ci.yml docker-image-scan (dorny/paths-filter gated):
+   - Skip fork PRs (no push secrets available anyway)
+   - cancel-in-progress on same PR
+   - Authenticate Docker Hub pull (raises anon rate-limit)
+   - docker buildx build --load (amd64) with --build-arg BASE_IMAGE
+   - Trivy image scan, exit-code: 1 on CRITICAL/HIGH fixable
+   - NO security-events: write (scan is advisory via exit code only)
             │
-   fail? ──► block auto-merge; Renovate dependency dashboard surfaces
+   fail? ──► block merge (job is a REQUIRED status check on main)
             │
             ▼ (pass)
-  Renovate auto-merges PR (digest-only, renovate[bot] commits only)
+  Required-check passes → Renovate platformAutomerge completes
             │
             ▼
   docker-publish.yml (push trigger on main):
-   build → Trivy image scan (final audit) → multi-arch push
-   publishes: latest, main, sha-<commit>
+   1. Build amd64 --load (scannable)
+   2. Trivy image scan (fail closed)
+   3. Smoke-test amd64 image (moved before push)
+   4. Multi-arch buildx build+push (reuses cache)
+   Publishes: latest, main, sha-<commit>
+   SARIF uploaded under trivy-image category
             │
             ▼
   rebuild-release-tags.yml (workflow_run on docker-publish.yml):
-   Guard: triggering commit authored by renovate[bot]
-          AND diff touches only Dockerfile
-          AND the change is digest-only on BASE_IMAGE
-   Fan-out:
-     - Resolve latest release tag via `gh release list`
-     - Checkout that tag into an ephemeral worktree
-     - Build with --build-arg BASE_IMAGE=<new digest>
+   on:
+     workflow_run:
+       workflows: ['docker-publish']
+       types: [completed]
+       branches: [main]
+   Guard job (structured checks, attacker-resistant):
+     a. workflow_run.conclusion == 'success'
+     b. workflow_run.event == 'push'
+     c. workflow_run.head_branch == 'main'
+     d. workflow_run.triggering_actor.login == 'renovate[bot]'
+     e. workflow_run.actor.login == 'renovate[bot]'
+     f. Commit at head_sha has verified signature AND signer is Renovate
+        GitHub App (via /commits/{sha} .commit.verification)
+     g. Diff at head_sha touches exactly one file: Dockerfile
+     h. Diff is a single-line replacement where old and new both match
+        ^ARG BASE_IMAGE=node:22-alpine@sha256:[0-9a-f]{64}$
+     i. No renames, mode changes, or other diff-status markers
+     j. Less than 10 minutes since the latest GitHub release was
+        published (defers to release flow if a release is mid-publish)
+     k. Repo variable ALLOW_AUTO_REBUILD == 'true' (kill-switch)
+   Rebuild job (only if guard passes):
+     - actions/checkout with ref: workflow_run.head_sha
+     - Extract new digest from Dockerfile at that exact SHA
+     - actions/checkout latest release tag (isLatest==true, strict
+       ^webssh2-server-v[0-9]+\.[0-9]+\.[0-9]+$ regex) into a worktree
+     - docker buildx build --build-arg BASE_IMAGE=<new digest>
      - Trivy image scan (fail closed)
-     - Multi-arch push: X.Y.Z, X.Y, X (image digest is new;
-       sha-<commit> tag on the release commit stays immutable)
-     - On success, comment on the GitHub release with the new image
-       digest and base-image digest
+     - Publish X.Y.Z, X.Y, X ONLY (type=sha disabled in metadata-action)
+     - Post-push assertion: registry digest of sha-<release-commit> is
+       unchanged from pre-rebuild snapshot
+     - Comment on the GitHub release with the new base + image digests
+   concurrency:
+     - Shared group 'image-publish' with docker-publish.yml (queue, don't cancel)
+     - Per-head_sha idempotency check (skip if already rebuilt for this SHA)
 ```
 
 ## Components
 
+### 0. Repository settings (PR 0, operator-run)
+
+Before any workflow changes ship, apply repo-level hardening via
+`gh api` (operator runs these; they are not workflow-editable):
+
+```bash
+# Enable auto-merge at repo level
+gh api -X PATCH repos/billchurch/webssh2 -f allow_auto_merge=true
+
+# Lock branch protection on main
+gh api -X PUT repos/billchurch/webssh2/branches/main/protection \
+  --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "build-lint-test",
+      "docker-image-scan"
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": null,
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": false,
+  "required_conversation_resolution": false,
+  "lock_branch": false,
+  "allow_fork_syncing": true,
+  "required_signatures": true
+}
+JSON
+```
+
+Notes:
+
+- `required_pull_request_reviews: null` preserves current "no review
+  required" posture (Renovate auto-merge depends on this). If the
+  operator later wants human review for non-Renovate PRs, add a CODEOWNERS
+  rule and flip this back on — the auto-merge path still works when PR
+  authors match an approved bot.
+- `required_signatures: true` keeps the existing posture and is load-bearing
+  for S1 in the red-team review: the rebuild workflow verifies that the
+  Renovate commit is signed by Renovate's GitHub App key.
+- `docker-image-scan` must be listed verbatim as it appears in the
+  workflow. To handle path-filter skips without failing the required
+  check, the job always runs a no-op "filter" step and reports success;
+  the expensive build+scan steps are conditional on the filter output.
+  Skipped jobs satisfy the required check as long as they complete.
+
 ### 1. `Dockerfile`
 
-Pin `node:22-alpine` by digest through a `BASE_IMAGE` build arg so
-event-driven rebuilds can override the digest without editing source:
+Pin `node:22-alpine` by manifest-list digest through a `BASE_IMAGE` build
+arg so event-driven rebuilds can override without editing source:
 
 ```dockerfile
 # syntax=docker/dockerfile:1.7
@@ -106,15 +223,15 @@ FROM ${BASE_IMAGE} AS runtime
 Notes:
 
 - The digest above is the currently-published `node:22-alpine` manifest-list
-  digest (Alpine 3.23.4) at the time of writing. The hotfix PR (PR 1) pins
-  this exact value.
-- Using the manifest-list digest preserves multi-arch support
-  (`linux/amd64`, `linux/arm64`).
-- The `ARG` must be redeclared before each `FROM` stage that references it
-  (Docker scoping rule). Declaring it once at the top then referencing via
-  `${BASE_IMAGE}` in `FROM` lines only works if the `ARG` is declared in
-  each stage before use, or declared as a global `ARG` before the first
-  `FROM`. The implementation plan specifies the exact placement.
+  digest (Alpine 3.23.4) at the time of writing; the hotfix PR (PR 1)
+  uses this exact value.
+- Manifest-list digest preserves multi-arch (`linux/amd64`, `linux/arm64`).
+- `ARG` scoping: global `ARG BASE_IMAGE=` declared before the first
+  `FROM`. Renovate's `dockerfile` manager rewrites the ARG default when
+  the digest changes; no per-stage redeclaration is needed because each
+  `FROM` references the global ARG directly.
+- `examples/Dockerfile` gets a non-functional comment pointing readers
+  to pin by digest (doc-only update; no behavior change).
 
 ### 2. `.github/renovate.json` (new)
 
@@ -122,17 +239,21 @@ Notes:
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", ":dependencyDashboard"],
-  "schedule": ["before 6am on monday"],
+  "schedule": ["* 0-6 * * *"],
   "timezone": "America/New_York",
   "dockerfile": { "enabled": true },
   "packageRules": [
     {
-      "description": "Auto-merge digest-only base image updates",
+      "description": "Auto-merge digest-only base image updates for node:22-alpine",
       "matchManagers": ["dockerfile"],
       "matchUpdateTypes": ["digest"],
+      "matchDepNames": ["node"],
+      "matchCurrentValue": "22-alpine",
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "groupName": null,
+      "separateMinorPatch": true
     },
     {
       "description": "Require human review for base image version bumps",
@@ -144,24 +265,38 @@ Notes:
 }
 ```
 
-The user is expected to enable the Renovate GitHub App against the
-repository as a one-time setup step outside this design.
+Notes:
+
+- Schedule runs daily during the 0-6 EST window, not weekly. A weekly
+  schedule leaves a multi-day gap between upstream Alpine patch and PR
+  open. Daily is low-cost for Renovate and lowers the attack window.
+- `matchDepNames: ['node']` + `matchCurrentValue: '22-alpine'` narrows
+  auto-merge to the one coordinate we actually trust. Any deviation (a
+  typo-squat, a `node:22-apline`, or a different tag) falls through to
+  the version-bump rule and requires review.
+- `groupName: null` + `separateMinorPatch: true` prevents Renovate from
+  bundling a digest bump with a version change into one PR; the
+  workflow-side guard (component 5) is defense in depth.
+- Enabling the Renovate GitHub App against the repo is a one-time
+  operator step, listed in the rollout plan.
 
 ### 3. `.github/workflows/ci.yml` (modify)
 
-Add a new job `docker-image-scan`, gated by a path filter so it only runs
-when relevant files change. Use `dorny/paths-filter` on `pull_request` to
-produce an `images` output that gates the subsequent build+scan steps:
+Add a `docker-image-scan` job. The job always runs (so it satisfies the
+required status check) but only builds and scans when a relevant file
+changed. Fork PRs are skipped entirely.
 
 ```yaml
 docker-image-scan:
   runs-on: ubuntu-latest
   if: github.event_name == 'pull_request'
+  concurrency:
+    group: docker-image-scan-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
   permissions:
     contents: read
-    security-events: write
   steps:
-    - uses: actions/checkout@<pinned-sha>  # pinned per supply-chain policy
+    - uses: actions/checkout@<pinned-sha>
     - id: filter
       uses: dorny/paths-filter@<pinned-sha>
       with:
@@ -169,201 +304,559 @@ docker-image-scan:
           image:
             - 'Dockerfile'
             - 'package-lock.json'
-            - '.github/workflows/ci.yml'
-    - if: steps.filter.outputs.image == 'true'
+            - 'package.json'
+            - '.github/workflows/docker-publish.yml'
+    - name: Skip when nothing image-relevant changed
+      if: steps.filter.outputs.image != 'true'
+      run: echo "No image-relevant changes; passing required check."
+    - name: Skip fork PRs
+      if: >-
+        steps.filter.outputs.image == 'true' &&
+        github.event.pull_request.head.repo.full_name != github.repository
+      run: echo "Fork PR; image scan skipped (advisory; main-branch scan is the gate)."
+    # Real work only runs for non-fork, image-relevant PRs
+    - if: >-
+        steps.filter.outputs.image == 'true' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      uses: docker/login-action@<pinned-sha>
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    - if: >-
+        steps.filter.outputs.image == 'true' &&
+        github.event.pull_request.head.repo.full_name == github.repository
       uses: docker/setup-buildx-action@<pinned-sha>
-    - if: steps.filter.outputs.image == 'true'
-      name: Build image (amd64, load for scanning)
+    - if: >-
+        steps.filter.outputs.image == 'true' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      name: Build amd64 image for scanning
       uses: docker/build-push-action@<pinned-sha>
       with:
         context: .
         load: true
         tags: webssh2:pr-${{ github.event.pull_request.number }}
         platforms: linux/amd64
-    - if: steps.filter.outputs.image == 'true'
+        cache-from: type=gha,scope=publish-refs/heads/main
+    - if: >-
+        steps.filter.outputs.image == 'true' &&
+        github.event.pull_request.head.repo.full_name == github.repository
       name: Trivy image scan
       uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
       with:
         image-ref: webssh2:pr-${{ github.event.pull_request.number }}
-        format: sarif
-        output: trivy-image.sarif
+        format: table
         severity: CRITICAL,HIGH
         ignore-unfixed: true
         exit-code: 1
-    - if: always() && steps.filter.outputs.image == 'true'
-      name: Upload SARIF
-      uses: github/codeql-action/upload-sarif@<pinned-sha>
-      with:
-        sarif_file: trivy-image.sarif
-        category: trivy-image
+        cache: true
 ```
 
-`<pinned-sha>` is notation; the implementation plan will resolve each
-placeholder to the current upstream release SHA, following the global
-supply-chain policy of pinning GitHub Actions by full commit SHA.
+Design choices and red-team mitigations:
 
-The existing filesystem Trivy scan stays; the new job adds image-level
-coverage. SARIF category is distinct so both scans surface independently in
-the Security tab.
+- No `security-events: write` on this job (S6). PR scan is advisory via
+  `exit-code: 1`; SARIF upload happens only on push, from
+  `docker-publish.yml`. Prevents attacker-supplied SARIF pollution.
+- Job always completes with success when nothing image-relevant changed,
+  so it satisfies the required status check. Expensive steps are
+  conditional on `filter.outputs.image == 'true'`.
+- `cache-from: type=gha,scope=publish-refs/heads/main` (read-only; no
+  `cache-to`) so PRs benefit from the main-line cache without being able
+  to poison it (S8).
+- Docker Hub authenticated pull (DoW1) raises the anon rate-limit from
+  100 to 200 pulls / 6 hours, which matters during PR storms.
+- Fork PRs skip the build step because they cannot access
+  `DOCKERHUB_TOKEN`. The trade-off (fork contributors don't get local
+  scan feedback) is acceptable; the post-merge `docker-publish.yml` scan
+  is the enforcement point.
 
 ### 4. `.github/workflows/docker-publish.yml` (modify)
 
-Insert an image-scan gate between build and push. Because the current
-workflow does a single multi-arch `buildx` push in one step, the
-implementation splits that into:
+Restructure to a four-phase flow: build amd64 → scan → smoke-test → push
+multi-arch. This addresses:
 
-1. Build `linux/amd64` locally with `--load` (scannable).
-2. Trivy image scan; fail closed on HIGH/CRITICAL fixable findings.
-3. On pass, run the full multi-arch `buildx` build+push. The amd64 layer is
-   cached from step 1 via `cache-from: type=gha`.
+- Image-scan gate (primary design requirement).
+- A4 in the red-team review (pre-existing defect: test-after-push).
 
-Trade-off: step 1 duplicates the amd64 build. The GHA cache reuse makes
-the push step pull layers from cache instead of rebuilding, so the net
-overhead is one extra scan + cache read (~1-2 min).
+```yaml
+concurrency:
+  group: image-publish                 # shared with rebuild-release-tags.yml (A1)
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    steps:
+      # ... existing checkout, qemu, buildx, login steps ...
+
+      - name: Build amd64 image (load, for scan + smoke)
+        uses: docker/build-push-action@<pinned-sha>
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: local/webssh2:scan
+          build-args: |
+            BASE_IMAGE=<read from Dockerfile ARG default>
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,scope=publish-${{ github.ref }}
+
+      - name: Trivy image scan (fail closed)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/webssh2:scan
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+          cache: true
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@<pinned-sha>
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Smoke-test amd64 image
+        run: |
+          CONTAINER_ID=$(docker run -d --rm \
+            -e DEBUG=webssh2:* local/webssh2:scan)
+          for i in {1..30}; do
+            if docker logs "$CONTAINER_ID" 2>&1 | grep -q "server started successfully"; then
+              docker stop "$CONTAINER_ID"; exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$CONTAINER_ID" && docker stop "$CONTAINER_ID" && exit 1
+
+      - name: Multi-arch build and push
+        id: build
+        uses: docker/build-push-action@<pinned-sha>
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=publish-${{ github.ref }}
+          cache-to: type=gha,mode=max,scope=publish-${{ github.ref }}
+```
+
+Design choices:
+
+- `concurrency.group: image-publish` is shared with the new rebuild
+  workflow so the two cannot interleave pushes during a release (A1).
+  `cancel-in-progress: false` queues rather than aborts.
+- Cache scope keyed to `github.ref` (S8) so feature branches can never
+  write into the main publish cache.
+- Smoke test runs BEFORE the multi-arch push (A4). The existing
+  "Test docker image" step that ran post-push is removed.
+- `type=sha` in metadata-action already produces `sha-<commit>`. That's
+  fine here — this workflow is the original source of truth for that
+  tag. S12's mitigation is confined to the rebuild workflow.
 
 ### 5. `.github/workflows/rebuild-release-tags.yml` (new)
 
-Trigger: `workflow_run` completion of `docker-publish.yml` on `main`.
+```yaml
+name: rebuild-release-tags
 
-First job `guard`:
+on:
+  workflow_run:
+    workflows: ['docker-publish']
+    types: [completed]
+    branches: [main]
 
-- Exits with success (no-op) unless all of the following hold:
-  - `github.event.workflow_run.head_commit.author.username == 'renovate[bot]'`
-  - The commit diff touches only `Dockerfile` (verified via `gh api` on
-    the commit).
-  - The Dockerfile diff modifies only the `BASE_IMAGE` default value
-    (regex on `^ARG BASE_IMAGE=...@sha256:[0-9a-f]{64}$`), not any other
-    line.
+concurrency:
+  group: image-publish                 # shared with docker-publish.yml (A1)
+  cancel-in-progress: false
 
-Second job `rebuild` (needs: guard, only runs when guard says "proceed"):
+permissions:
+  contents: read
+  packages: write
 
-- `gh release list --limit 50 --json tagName --jq '[.[] | select(.tagName | startswith("webssh2-server-v"))][0].tagName'`
-  to resolve the latest release tag.
-- `gh release download` is not needed; checkout the tag via
-  `actions/checkout` with `ref: <tag>`.
-- Extract the new base digest from the Dockerfile on `main`:
-  `grep -E '^ARG BASE_IMAGE=' Dockerfile`.
-- Run the same build → scan → multi-arch push steps as
-  `docker-publish.yml`, but with `--build-arg BASE_IMAGE=<new digest>` so
-  the release-tag source tree is rebuilt against the fresh base.
-- Compute tags using the same semver-derivation logic already present in
-  `docker-publish.yml` (extract from release tag name). Publish to
-  `X.Y.Z`, `X.Y`, `X`.
-- Do **not** republish `sha-<release-commit>` (it already exists and must
-  stay immutable on its original digest). The new image digest is tracked
-  via the `X.Y.Z` tag's manifest digest and surfaced in the release
-  comment.
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      head_sha: ${{ github.event.workflow_run.head_sha }}
+      new_digest: ${{ steps.extract.outputs.new_digest }}
+      release_tag: ${{ steps.release.outputs.tag }}
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.triggering_actor.login == 'renovate[bot]' &&
+      github.event.workflow_run.actor.login == 'renovate[bot]' &&
+      vars.ALLOW_AUTO_REBUILD == 'true'
+    steps:
+      - name: Checkout at head_sha (not main HEAD)
+        uses: actions/checkout@<pinned-sha>
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Verify commit is signed by Renovate GitHub App
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          verification=$(gh api repos/${{ github.repository }}/commits/${HEAD_SHA} \
+            --jq '.commit.verification')
+          verified=$(echo "$verification" | jq -r '.verified')
+          reason=$(echo "$verification"  | jq -r '.reason')
+          if [ "$verified" != "true" ] || [ "$reason" != "valid" ]; then
+            echo "::error::Commit ${HEAD_SHA} is not signed-and-verified"
+            exit 1
+          fi
+      - name: Verify diff is digest-only on Dockerfile
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          parent=$(git rev-parse ${HEAD_SHA}^)
+          files=$(git diff --name-status "${parent}" "${HEAD_SHA}")
+          [ "$files" = $'M\tDockerfile' ] || { echo "::error::Unexpected diff: $files"; exit 1; }
+          hunks=$(git diff "${parent}" "${HEAD_SHA}" -- Dockerfile | \
+                  grep -E '^[+-]ARG BASE_IMAGE=' || true)
+          removed=$(echo "$hunks" | grep -c '^-ARG BASE_IMAGE=' || true)
+          added=$(echo   "$hunks" | grep -c '^+ARG BASE_IMAGE=' || true)
+          if [ "$removed" != "1" ] || [ "$added" != "1" ]; then
+            echo "::error::Expected exactly one BASE_IMAGE line change; got -$removed +$added"
+            exit 1
+          fi
+          pattern='^[+-]ARG BASE_IMAGE=node:22-alpine@sha256:[0-9a-f]{64}$'
+          echo "$hunks" | grep -Eq "$pattern" || { echo "::error::Diff lines do not match strict pattern"; exit 1; }
+      - name: Defer if release was published in last 10 minutes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          published=$(gh release list --limit 1 --json publishedAt --jq '.[0].publishedAt')
+          if [ -n "$published" ] && [ $(( $(date +%s) - $(date -d "$published" +%s) )) -lt 600 ]; then
+            echo "::error::Release published within 10 minutes; deferring to release flow"
+            exit 1
+          fi
+      - id: extract
+        name: Extract new BASE_IMAGE digest from Dockerfile at head_sha
+        run: |
+          digest=$(grep -E '^ARG BASE_IMAGE=' Dockerfile | head -1 | sed 's/^ARG BASE_IMAGE=//')
+          echo "new_digest=$digest" >> "$GITHUB_OUTPUT"
+      - id: release
+        name: Resolve latest release tag via isLatest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(gh release list --limit 50 --json tagName,isLatest,isDraft,isPrerelease \
+                --jq '.[] | select(.isLatest==true and .isDraft==false and .isPrerelease==false) | .tagName')
+          if ! [[ "$tag" =~ ^webssh2-server-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::No qualifying release tag; skipping"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+      - id: decide
+        name: Per-head_sha idempotency check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if [ -z "$RELEASE_TAG" ]; then echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          body=$(gh release view "$RELEASE_TAG" --json body --jq '.body')
+          if echo "$body" | grep -q "rebuild-sha: ${HEAD_SHA}"; then
+            echo "::notice::Already rebuilt for ${HEAD_SHA}"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
 
-On success, post a comment to the GitHub release:
+  rebuild:
+    runs-on: ubuntu-latest
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    permissions:
+      contents: write       # to post release comment
+      packages: write
+    env:
+      HEAD_SHA: ${{ needs.guard.outputs.head_sha }}
+      NEW_DIGEST: ${{ needs.guard.outputs.new_digest }}
+      RELEASE_TAG: ${{ needs.guard.outputs.release_tag }}
+    steps:
+      - name: Snapshot existing sha-tag digest (for post-push assertion)
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          # release commit SHA from tag
+          release_sha=$(gh api repos/${{ github.repository }}/git/ref/tags/${RELEASE_TAG} \
+            --jq '.object.sha')
+          echo "RELEASE_SHA=${release_sha}" >> "$GITHUB_ENV"
+          # query Docker Hub for current sha-<short> digest
+          short=${release_sha:0:7}
+          before=$(curl -fsSL "https://hub.docker.com/v2/repositories/billchurch/webssh2/tags/sha-${short}" \
+            | jq -r '.digest' 2>/dev/null || echo "")
+          echo "SHA_TAG_DIGEST_BEFORE=${before}" >> "$GITHUB_ENV"
 
-```text
-🔁 Base image refreshed (no source changes)
-- Base image: node:22-alpine@sha256:<new digest>
-- Refreshed tags: X.Y.Z, X.Y, X
-- New image digest: sha256:<digest>
-- Triggered by: <renovate PR link>
+      - name: Checkout release tag source into worktree
+        uses: actions/checkout@<pinned-sha>
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+          path: release-src
+          fetch-depth: 0
+
+      - name: Overlay new BASE_IMAGE digest onto release-src Dockerfile
+        working-directory: release-src
+        run: |
+          sed -i "s|^ARG BASE_IMAGE=.*|ARG BASE_IMAGE=${NEW_DIGEST}|" Dockerfile
+          grep -E '^ARG BASE_IMAGE=' Dockerfile   # sanity check
+
+      - uses: docker/setup-qemu-action@<pinned-sha>
+      - uses: docker/setup-buildx-action@<pinned-sha>
+      - uses: docker/login-action@<pinned-sha>
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@<pinned-sha>
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 for scan
+        uses: docker/build-push-action@<pinned-sha>
+        with:
+          context: release-src
+          load: true
+          platforms: linux/amd64
+          tags: local/webssh2-rebuild:scan
+
+      - name: Trivy image scan (fail closed)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/webssh2-rebuild:scan
+          format: sarif
+          output: trivy-rebuild.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+          cache: true
+
+      - name: Derive semver tags
+        id: semver
+        run: |
+          tag="${RELEASE_TAG#webssh2-server-v}"
+          major="${tag%%.*}"
+          minor="${tag%.*}"
+          echo "full=$tag"     >> "$GITHUB_OUTPUT"
+          echo "minor=$minor"  >> "$GITHUB_OUTPUT"
+          echo "major=$major"  >> "$GITHUB_OUTPUT"
+
+      - name: Multi-arch build and push (semver tags ONLY; no sha-tag)
+        uses: docker/build-push-action@<pinned-sha>
+        id: push
+        with:
+          context: release-src
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            docker.io/billchurch/webssh2:${{ steps.semver.outputs.full }}
+            docker.io/billchurch/webssh2:${{ steps.semver.outputs.minor }}
+            docker.io/billchurch/webssh2:${{ steps.semver.outputs.major }}
+            ghcr.io/billchurch/webssh2:${{ steps.semver.outputs.full }}
+            ghcr.io/billchurch/webssh2:${{ steps.semver.outputs.minor }}
+            ghcr.io/billchurch/webssh2:${{ steps.semver.outputs.major }}
+
+      - name: Assert sha-tag digest unchanged
+        run: |
+          short=${RELEASE_SHA:0:7}
+          after=$(curl -fsSL "https://hub.docker.com/v2/repositories/billchurch/webssh2/tags/sha-${short}" \
+            | jq -r '.digest')
+          if [ "$after" != "${SHA_TAG_DIGEST_BEFORE}" ]; then
+            echo "::error::sha-${short} digest changed from ${SHA_TAG_DIGEST_BEFORE} to ${after}"
+            exit 1
+          fi
+
+      - name: Comment on release with new image digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.workflow_run.pull_requests[0].html_url }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          body=$(printf '%s\n' \
+            "🔁 Base image refreshed (no source changes)" \
+            "- Base image: ${NEW_DIGEST}" \
+            "- Refreshed tags: ${RELEASE_TAG#webssh2-server-v}, ${{ steps.semver.outputs.minor }}, ${{ steps.semver.outputs.major }}" \
+            "- New image digest: ${IMAGE_DIGEST}" \
+            "- Triggered by: ${PR_URL}" \
+            "" \
+            "rebuild-sha: ${HEAD_SHA}")
+          current=$(gh release view "$RELEASE_TAG" --json body --jq '.body')
+          gh release edit "$RELEASE_TAG" --notes "${current}
+
+${body}"
 ```
 
-On scan failure, fail the workflow and let the existing GitHub Actions
-notification surface the error. No issue auto-filing in this iteration; if
-failures prove frequent, add in a follow-up.
+Design choices and red-team mitigations (paren refs):
+
+- Guard `if:` uses `triggering_actor.login` + `actor.login` (both GH-
+  verified) and verifies commit signature (S1, S7).
+- All git/API reads are keyed to `workflow_run.head_sha`, never `main`
+  HEAD (S3).
+- Structured diff check: `git diff --name-status` requires exactly
+  `M<tab>Dockerfile`, then a strict regex requires exactly one removed
+  and one added `ARG BASE_IMAGE=node:22-alpine@sha256:<64 hex>` line
+  (S5).
+- `workflow_run` is filtered on `conclusion`, `event`, and
+  `head_branch` explicitly (S9).
+- `concurrency.group: image-publish` is shared with `docker-publish.yml`
+  (S10, A1). A 10-minute defer check guards against the release-flow
+  race explicitly (A1).
+- Release tag resolved via `isLatest==true` + strict regex excluding
+  drafts and pre-releases (S13).
+- `type=sha` is omitted entirely from the tag list; only semver tags
+  are pushed. Post-push assertion reads Docker Hub and fails if the
+  release-commit `sha-<short>` tag digest changed (S12).
+- Per-`head_sha` idempotency via marker string in release body (DoW2).
+- `ALLOW_AUTO_REBUILD` repo variable acts as a manual kill-switch (S7).
+
+### 6. `examples/Dockerfile`
+
+Comment-only update:
+
+```dockerfile
+# NOTE: This is a documentation sample, not the production Dockerfile.
+# For production, pin the base image by manifest digest — see the
+# repo-root Dockerfile:
+#   ARG BASE_IMAGE=node:22-alpine@sha256:...
+FROM node:22-alpine
+```
+
+No build behavior changes; Renovate does not auto-manage this file.
 
 ## Data Flow / Tag Strategy
 
 | Event                                  | Tags published                           | Image digest |
 | -------------------------------------- | ---------------------------------------- | ------------ |
 | Code change merged to `main`           | `latest`, `main`, `sha-<commit>`         | New          |
-| Release tag cut                        | `X.Y.Z`, `X.Y`, `X`, optionally `latest` | New          |
-| Renovate digest bump merged to `main`  | `latest`, `main`, `sha-<commit>` **and** `X.Y.Z`, `X.Y`, `X` | New for each path |
+| Release tag cut                        | `X.Y.Z`, `X.Y`, `X`, `sha-<release-commit>`, optionally `latest` | New          |
+| Renovate digest bump merged to `main`  | `latest`, `main`, `sha-<renovate-commit>` **and** `X.Y.Z`, `X.Y`, `X` (no sha-tag) | New for each path |
 
-`sha-<commit>` tags are never moved. Each represents the exact image built
-from that commit with whatever base digest was in effect at that time.
+`sha-<commit>` tags are never moved after their original publish. The
+rebuild workflow explicitly does not push a sha-tag; it asserts the
+release-commit sha-tag digest is unchanged as a safety check.
 
 ## Error Handling
 
-| Failure mode                                | Behavior                                    |
-| ------------------------------------------- | ------------------------------------------- |
-| Renovate PR fails image scan                | Auto-merge blocked; Renovate dashboard issue surfaces the failure |
-| `docker-publish.yml` scan fails             | Publish aborts; `main` and `latest` keep their previous digests |
-| `rebuild-release-tags.yml` scan fails       | Release tags keep their previous digests; workflow shows failed status |
-| Guard logic misfires (false positive)       | Release tags get rebuilt against same source — idempotent, no harm |
-| Guard logic misfires (false negative)       | Release tags stay stale until next Renovate PR or manual dispatch |
-| Release tag not found (e.g., pre-first-release) | Workflow exits 0 with a log message     |
-| Trivy DB download failure                   | Retry once; on second failure, fail closed  |
-| Registry push failure                       | Standard `docker/build-push-action` retries; manual rerun otherwise |
+| Failure mode                                     | Behavior                                    |
+| ------------------------------------------------ | ------------------------------------------- |
+| Renovate PR fails image scan                     | Required check fails; PR blocked; auto-merge does not fire |
+| Renovate PR author impersonation                 | Signature verification fails at guard step g; rebuild job does not run |
+| Grouped version+digest PR reaches main           | Structured diff check fails; rebuild skipped |
+| `docker-publish.yml` scan fails                  | Publish aborts; existing `latest`/`main` tags unchanged |
+| Rebuild workflow race with release flow          | Shared `image-publish` concurrency queues them; 10-minute defer adds belt-and-suspenders |
+| Rebuild workflow scan fails                      | Release tags unchanged; workflow shows failed status |
+| Release tag deleted or missing `isLatest`        | Guard exits with `proceed=false`; no-op |
+| `ALLOW_AUTO_REBUILD` set to false (kill-switch)  | Guard job's `if:` fails; rebuild does not run |
+| Upstream `node:22-alpine` digest disappears      | Builds fail; Renovate opens a new PR (daily schedule); manual dispatch available as fallback |
+| Trivy DB download failure                        | Action retries; repeated failure fails closed |
+| Post-push sha-tag digest changed                 | Workflow fails loudly; tags are already pushed so manual remediation needed (should be unreachable) |
 
 ## Testing Strategy
 
-1. **Image scan (PR gate)**: Open a draft PR that pins `BASE_IMAGE` to a
-   known-vulnerable historic digest (e.g., an older Alpine with published
-   HIGH CVEs). Confirm the `docker-image-scan` job fails and blocks
-   merge. Close the draft without merging.
-2. **Publish-time scan**: Same technique against a branch that can trigger
-   `docker-publish.yml` via `workflow_dispatch`. Confirm publish is
-   aborted on scan failure.
-3. **Release-tag rebuild guard**: Dispatch `rebuild-release-tags.yml`
-   manually with a synthetic `workflow_run` context that does not meet
-   the guard criteria (e.g., non-`renovate[bot]` author). Confirm guard
-   job exits with "skip" status.
-4. **Release-tag rebuild happy path**: After PR 4 merges, simulate via
-   manual dispatch with a `simulate=true` input that runs all steps
-   except the final `docker push`. Inspect the Trivy report and the tags
-   that *would* have been pushed.
-5. **End-to-end**: After all PRs are live, wait for the first
-   Renovate-generated digest PR. Observe: CI scan runs, auto-merge,
-   `docker-publish.yml` fires, `rebuild-release-tags.yml` fans out,
-   release-tag image digest changes. Document observed digests in a
-   closing comment on #498.
+1. **Repo-level protection (PR 0):** After applying, open a throwaway PR
+   from a branch that has no `docker-image-scan` change; verify the
+   required check passes as a "skipped but successful" job.
+2. **Image scan (PR 2):** Draft PR pinning `BASE_IMAGE` to a historic
+   digest with known HIGH CVEs; confirm `docker-image-scan` fails and
+   blocks merge. Close draft.
+3. **Publish-time scan (PR 2):** Dispatch `docker-publish.yml` via
+   `workflow_dispatch` on a branch with the same bad digest; confirm the
+   multi-arch push is aborted.
+4. **Smoke-test ordering (PR 2):** On a branch with a broken entrypoint,
+   confirm the workflow fails before push and the `latest` tag is
+   unchanged.
+5. **Renovate wiring (PR 3):** After enabling the app, observe the
+   onboarding PR; verify `renovate.json` takes effect on the first
+   real digest PR.
+6. **Rebuild guard — happy path (PR 4):** Manual dispatch with
+   `simulate=true` input (added to workflow for testing only) against
+   the latest Renovate merge; inspect each guard step's output.
+7. **Rebuild guard — negative cases:** Dispatch with contrived
+   `workflow_run` contexts missing each guard criterion; confirm the
+   job's `if:` evaluates to false.
+8. **End-to-end:** Wait for the first real Renovate digest PR after all
+   PRs land. Observe: CI scan passes → auto-merge → `docker-publish.yml`
+   fires → `rebuild-release-tags.yml` guard passes → release tags
+   republished. Document observed digests in a closing comment on #498.
 
 ## Rollout Plan
 
-Four PRs, merged in order. Each is individually shippable; no feature
-flags needed.
+Five PRs (PR 0 is operator-run, not code), each individually shippable.
+
+### PR 0 — Repo settings (operator runs gh api commands)
+
+- Apply `allow_auto_merge=true`.
+- Lock `main` branch protection: required status checks = `[build-lint-test,
+  docker-image-scan]`, no force-pushes, signed commits required.
+- Verify via `gh api repos/billchurch/webssh2/branches/main/protection`.
+- Create repo variable `ALLOW_AUTO_REBUILD=true`.
 
 ### PR 1 — Hotfix (closes #498)
 
-- Modify `Dockerfile`: add `ARG BASE_IMAGE=node:22-alpine@sha256:<3.23.4 digest>`
-  and update each `FROM` line to reference `${BASE_IMAGE}`.
-- Verify locally: `docker build . && docker inspect ... | grep Image`.
-- Merge, then manually trigger `docker-publish.yml` via `workflow_dispatch`
-  with `publish_latest=true`.
-- Comment on #498 with the new image digest and base-image digest; close.
+- Modify `Dockerfile`: add global `ARG BASE_IMAGE=node:22-alpine@sha256:<3.23.4 digest>`.
+  Update each `FROM` to `FROM ${BASE_IMAGE}`.
+- Verify locally: `docker build -t test . && docker inspect test --format '{{.Image}}'`.
+- Merge. Manually dispatch `docker-publish.yml` with `publish_latest=true`.
+- Comment on #498 with new image digest + base-image digest; close.
 
-### PR 2 — Image scanning
+### PR 2 — Image scanning + publish restructure
 
-- Add `docker-image-scan` job to `ci.yml` (path-filtered).
-- Modify `docker-publish.yml` to split build + scan + push.
-- Test via a draft PR with a deliberately bad digest; confirm both gates
-  block publication.
-- Revert the bad digest; merge the workflow changes.
+- Add `docker-image-scan` job to `ci.yml` (always runs, conditionally does work).
+- Restructure `docker-publish.yml` to four-phase: build amd64 → scan →
+  smoke-test → multi-arch push.
+- Add shared `concurrency.group: image-publish`.
+- Scope GHA cache by ref.
+- Verify via deliberately bad digest in a draft PR; confirm both gates
+  block. Revert bad digest; merge.
 
-### PR 3 — Renovate configuration
+### PR 3 — Renovate configuration + examples/Dockerfile comment
 
-- Add `.github/renovate.json`.
-- User enables Renovate GitHub App against repo.
+- Add `.github/renovate.json` with the rules in component 2.
+- Add pinning reminder comment to `examples/Dockerfile`.
+- Operator enables Renovate GitHub App against the repo.
 - Wait for Renovate's onboarding PR; review and merge.
-- First real Renovate digest PR validates end-to-end flow.
+- Do NOT merge any real digest PR from Renovate until PR 4 ships — until
+  then, `rebuild-release-tags.yml` does not exist and only `latest`/`main`
+  will refresh.
 
 ### PR 4 — Event-driven release-tag rebuild
 
-- Add `.github/workflows/rebuild-release-tags.yml`.
-- Include a `simulate` input flag for dry-run testing.
-- Run simulated dispatches before the next Renovate digest PR lands.
-- After first real fire, document observed behavior in a follow-up issue
-  if any adjustments are needed.
+- Add `.github/workflows/rebuild-release-tags.yml` per component 5.
+- Include `simulate` input on `workflow_dispatch` for dry-run testing
+  (short-circuits the actual `docker push`).
+- Run simulated dispatches against all guard criteria (positive and
+  negative cases).
+- Arm in production. Document observed digests in a closing comment on
+  #498 after first real fire.
 
-## Open Questions (to resolve during planning)
+## Follow-Ups (Deferred)
 
-- Renovate timezone choice: design assumes `America/New_York`; confirm
-  during planning if different preference.
-- Whether to also publish image attestations (`docker build --attest`)
-  alongside scans. Valuable for provenance but adds complexity — deferred
-  unless user wants it folded in.
+Tracked as future issues, not blocking the rollout:
+
+- **GHCR registry cache** instead of GHA cache (DoW3).
+- **Auto-revert on post-merge scan failure** (A5 extension).
+- **Pre-push sha-tag immutability check** in `docker-publish.yml` for
+  `workflow_dispatch` against historic commits (A8).
+- **Docker Hub credential scope audit** — verify `DOCKERHUB_TOKEN`
+  scope is "write only to `billchurch/webssh2`"; narrow if broader.
+- **Image attestations** (`docker build --attest=type=provenance`) for
+  verifiable build provenance.
 
 ## References
 
-- Global policy: `~/.claude/rules/supply-chain-security.md`
-- Project CLAUDE.md: `/Users/bill/Documents/GitHub/webssh/webssh2/CLAUDE.md`
+- Global supply-chain policy: `~/.claude/rules/supply-chain-security.md`
+- Project instructions: `CLAUDE.md`
+- Red-team review:
+  `DOCS/superpowers/specs/2026-04-24-docker-supply-chain-hardening-red-team.md`
 - Current Dockerfile: `Dockerfile`
-- Current workflows: `.github/workflows/ci.yml`, `.github/workflows/docker-publish.yml`
+- Current workflows: `.github/workflows/ci.yml`,
+  `.github/workflows/docker-publish.yml`
 - Issue: [#498](https://github.com/billchurch/webssh2/issues/498)
