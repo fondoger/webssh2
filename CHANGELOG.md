@@ -1,5 +1,77 @@
 # Changelog
 
+## [5.0.0](https://github.com/fondoger/webssh2/compare/webssh2-server-v4.2.2...webssh2-server-v5.0.0) (2026-04-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ux:** Error responses are now JSON-only. Clients must handle the 'connection-error' event to display connection failures.
+* **sftp:** SFTP protocol updated - clients must not send transferId in start requests; use server-provided ID from response.
+
+### Features
+
+* add backpressure control to SFTP download streaming ([ec684ea](https://github.com/fondoger/webssh2/commit/ec684eaa2feb2c2ab1b11d9f743356bbdcb3dccf)), closes [#492](https://github.com/fondoger/webssh2/issues/492)
+* add server-side generic prompt interface ([#465](https://github.com/fondoger/webssh2/issues/465)) ([e96f979](https://github.com/fondoger/webssh2/commit/e96f979cbf3b034ff075b6e6d783fe56c164320b))
+* add SFTP support, fixes [#322](https://github.com/fondoger/webssh2/issues/322) ([cc5d932](https://github.com/fondoger/webssh2/commit/cc5d93214b244cac5692ecd6ebb6871d508f1f39))
+* add telnet protocol support ([#490](https://github.com/fondoger/webssh2/issues/490)) ([c7c6103](https://github.com/fondoger/webssh2/commit/c7c6103bfc36aed1461d345a74ece16fcd6e7670))
+* **debug:** add ssh2 protocol-level debug logging ([#469](https://github.com/fondoger/webssh2/issues/469)) ([e4ba8fa](https://github.com/fondoger/webssh2/commit/e4ba8fa62153e73ae496bd4c8054fdea4cad7f1a))
+* **docker:** append Docker image info to GitHub releases [skip ci] ([2911905](https://github.com/fondoger/webssh2/commit/29119059d695f457efdcc50183f67f416c184f12))
+* **docs:** add keyboard capture documentation and quick reference ([7b08ca5](https://github.com/fondoger/webssh2/commit/7b08ca512c7bc8c3a000f0cc4a61b18918575029))
+* emit raw Buffer for SFTP download chunks instead of base64 ([5d5440f](https://github.com/fondoger/webssh2/commit/5d5440f55eecb9eefecc989b43ed63b714ef457c))
+* **host-key:** add hostkey socket events to constants ([cc23da0](https://github.com/fondoger/webssh2/commit/cc23da01d552fc32c35125c9995c976e104ed542))
+* **host-key:** add hostKeyVerification to legacy socket-adapter permissions ([1a69405](https://github.com/fondoger/webssh2/commit/1a69405dbc01d09e2749881e88383360a58668dd))
+* **host-key:** implement hostVerifier callback factory ([62ef1cb](https://github.com/fondoger/webssh2/commit/62ef1cbaf8018db7525544c4b01fdfef9e79c43c))
+* **host-key:** send host key config with permissions event ([47a0f70](https://github.com/fondoger/webssh2/commit/47a0f7011f2124c86e8e841b32015c595f75bf90))
+* **host-key:** wire hostVerifier into SSH service connect flow ([eddf34e](https://github.com/fondoger/webssh2/commit/eddf34e4a18ab6b5d05afb62a8577e583e307a06))
+* Implemented rate limiting and output truncation features in the SSH service to prevent memory overflow during high-volume output. fixes [#451](https://github.com/fondoger/webssh2/issues/451) ([b575bba](https://github.com/fondoger/webssh2/commit/b575bba1445ff15aba596f5a52314dfae506156b))
+* send host key verification config pre-auth and honor env vars in hostkeys script ([97cb173](https://github.com/fondoger/webssh2/commit/97cb1730ac7f6eac3525b262e554b651668c5980))
+* **sftp:** add shell-command file backend for BusyBox devices ([c33a7e8](https://github.com/fondoger/webssh2/commit/c33a7e88c2f823c9d730f2eb134ea546e0b1cd3d))
+* **sftp:** add shell-command file backend for BusyBox devices ([#483](https://github.com/fondoger/webssh2/issues/483)) ([dbebb23](https://github.com/fondoger/webssh2/commit/dbebb239f35075bd93db3ee28177568777894ebb))
+* SSH host key verification (TOFU) ([dc22703](https://github.com/fondoger/webssh2/commit/dc227030dfc9801aababca9af40a78c3b69070ec))
+* update webssh2_client dependency to version 3.4.0 ([7ae7e63](https://github.com/fondoger/webssh2/commit/7ae7e6308ccd62045320b3653bc298e258ec71aa))
+* update webssh2_client to version 2.2.0 ([ffdb9b7](https://github.com/fondoger/webssh2/commit/ffdb9b701fe7e6a86195dfd8a32d06e4a295f73d))
+* **ux:** client-side connection error modal with algorithm debugging ([#476](https://github.com/fondoger/webssh2/issues/476)) ([2236a4e](https://github.com/fondoger/webssh2/commit/2236a4eff14d2540f2c823fa0eb17b2154b41907))
+
+
+### Bug Fixes
+
+* add re-entrancy guard and cancellation cleanup to SFTP backpressure ([5ae39ac](https://github.com/fondoger/webssh2/commit/5ae39ace391a9d33415ed29947ad5ef79e987dab))
+* add vite override to resolve HIGH audit finding in CI ([4c20966](https://github.com/fondoger/webssh2/commit/4c20966330534613a90a8f1caa9b918eda1c7c76))
+* address code review findings for host key verification ([6f53016](https://github.com/fondoger/webssh2/commit/6f530169f93ec8491136d5f72499d5d1eb0849e3))
+* **ci:** use PAT_WORKFLOW token for Docker build dispatch [skip ci] ([0e1c280](https://github.com/fondoger/webssh2/commit/0e1c2802a21267d3bd4c677ff14e19658fca691e))
+* csp headers upgrade-insecure-requests cause browser to attempt https, removed. fixes [#434](https://github.com/fondoger/webssh2/issues/434) ([#435](https://github.com/fondoger/webssh2/issues/435)) ([ac87aaf](https://github.com/fondoger/webssh2/commit/ac87aaf833158029c94570ab56c936de7bdd0611))
+* **docker:** optimize builder stage and add timeout ([d07df7b](https://github.com/fondoger/webssh2/commit/d07df7b9837c5a5ec5583f7c30eef2df78ae9097))
+* lint error in SFTP backpressure test (strict boolean expression) ([54a8fbc](https://github.com/fondoger/webssh2/commit/54a8fbc101fb9c1c21a6a42b9b3f0fe681266170))
+* package.json & package-lock.json to reduce vulnerabilities ([#440](https://github.com/fondoger/webssh2/issues/440)) ([6e3261b](https://github.com/fondoger/webssh2/commit/6e3261b6a9aaf1b7ea685831afb48779593d962b))
+* package.json & package-lock.json to reduce vulnerabilities ([#453](https://github.com/fondoger/webssh2/issues/453)) ([9a9719b](https://github.com/fondoger/webssh2/commit/9a9719b814a9f07a07f6bb5745be0611804e5018))
+* patch HIGH CVE dependencies and pin versions ([391d64f](https://github.com/fondoger/webssh2/commit/391d64f60c0d04c3dfa3ede98f9858698f269048))
+* **perf:** binary WebSocket transport and backpressure fix ([#479](https://github.com/fondoger/webssh2/issues/479)) ([2cc6ba0](https://github.com/fondoger/webssh2/commit/2cc6ba0b8b9f08db136c53080efef219eae767a9))
+* pin node:22-alpine base image by digest ([#498](https://github.com/fondoger/webssh2/issues/498)) ([#499](https://github.com/fondoger/webssh2/issues/499)) ([ac41510](https://github.com/fondoger/webssh2/commit/ac4151097bc3f32c2440060a0b56e5d2691a5e40))
+* private key authentication not working with config credentials ([#443](https://github.com/fondoger/webssh2/issues/443)) ([e43c811](https://github.com/fondoger/webssh2/commit/e43c811ce38eddb2ddf3d04a50c5158af46a0532))
+* reduce awaitClientVerification params to options object (S107) and use structuredClone (S7784) ([a6163d6](https://github.com/fondoger/webssh2/commit/a6163d6163fed778dc736d07e04deaa1c5f73bcb))
+* Refactor constants import paths and enhance SSH output handling ([b575bba](https://github.com/fondoger/webssh2/commit/b575bba1445ff15aba596f5a52314dfae506156b))
+* remove void operator from test files (S3735) ([3bec992](https://github.com/fondoger/webssh2/commit/3bec992c4aec97afa0a9b2ba2d9d6ee36b748f52))
+* resolve lint errors blocking CI ([6e576d6](https://github.com/fondoger/webssh2/commit/6e576d6a248155af6caf5d85259f55b291894905))
+* resolve lint errors in test files ([ad14af9](https://github.com/fondoger/webssh2/commit/ad14af90e5722872a79f8338aa32cfcd459785ea))
+* resolve markdownlint warnings in host-key-protocol.md ([142db67](https://github.com/fondoger/webssh2/commit/142db67ba699cb754e0ecba8d24ced642e6fdc72))
+* resolve SonarQube issues across codebase (S3735, S3776, S2871, S4623, S6557, S4043, S7763, S4325, S6594, S7781, S7755, S7784, S7924) ([b33dc6d](https://github.com/fondoger/webssh2/commit/b33dc6dcc73aecdc9b5aa67561ae68fcd51185e0))
+* resolve SonarQube lint warnings in shell-commands ([6c1035e](https://github.com/fondoger/webssh2/commit/6c1035ec285cf70d5901b306caed359c968f402f))
+* resolve SonarQube quality gate failures on PR [#488](https://github.com/fondoger/webssh2/issues/488) ([6315836](https://github.com/fondoger/webssh2/commit/63158369f5ed1b0bdd8efe3304c3042ce9f75b76))
+* resolve stale waitForDrain promise on concurrent calls, add missing tests ([46c86c1](https://github.com/fondoger/webssh2/commit/46c86c14e778b5e6e2b35880723b95d96399d549))
+* respect config ssh port ([#432](https://github.com/fondoger/webssh2/issues/432)) ([dcaf257](https://github.com/fondoger/webssh2/commit/dcaf2574fade5f517c13dbb7e88eccc61c2e1fcd))
+* SFTP download backpressure and binary transfer ([#492](https://github.com/fondoger/webssh2/issues/492)) ([ca88c95](https://github.com/fondoger/webssh2/commit/ca88c954a1d55663a1c8020590bc85cb56a60ef9))
+* SFTP error propagation with fileName + relax waitForPrompt regex ([213ec12](https://github.com/fondoger/webssh2/commit/213ec12cd009c64ee4044d95a66e51efffea4030))
+* **sftp:** server-side transfer ID generation and ownership verification ([#467](https://github.com/fondoger/webssh2/issues/467)) ([e3ebea2](https://github.com/fondoger/webssh2/commit/e3ebea2776611a601491b97f96c89cd69ada0bfb))
+* **sftp:** use basename for download filename in shell backend ([d84b78c](https://github.com/fondoger/webssh2/commit/d84b78cfad6ab428c8fea0dba646755ae4386f72))
+* SSH algorithm env var precedence and debug output improvements ([#460](https://github.com/fondoger/webssh2/issues/460)) ([bceb5b8](https://github.com/fondoger/webssh2/commit/bceb5b85bc7faeac610ec28957fd0640b2247e38)), closes [#459](https://github.com/fondoger/webssh2/issues/459)
+* **ssh:** ensure environment variable algorithms are always honored ([#473](https://github.com/fondoger/webssh2/issues/473)) ([9a9077b](https://github.com/fondoger/webssh2/commit/9a9077beb9d795cf5f266764972005a2222c9e07))
+* sync package-lock.json with webssh2_client 3.6.0 ([eece96d](https://github.com/fondoger/webssh2/commit/eece96dd833a9b5e27a353a18eff8763e59cc486))
+* **tests:** add hostKeyVerification to socket-v2 mock config ([0a76bea](https://github.com/fondoger/webssh2/commit/0a76bea6c131a5d87818d6f34da521499caa2069))
+* update rollup to 4.59.0 for GHSA-mw96-cpmx-2vgc path traversal fix ([dbea2df](https://github.com/fondoger/webssh2/commit/dbea2dff7c705286f56fd26d16dc0928c983cfdc))
+* update trivy-action to v0.35.0 and add vite override ([4fb397d](https://github.com/fondoger/webssh2/commit/4fb397d461c3644e30d191483ad82c0245ebae70))
+* use correct secret name for workflow dispatch PAT ([7036788](https://github.com/fondoger/webssh2/commit/7036788a2d4d2a7504fc8099d48d59e107032618))
+* use eslint-disable for no-new in side-effect constructors ([bdd7991](https://github.com/fondoger/webssh2/commit/bdd7991aba42b8b3dd1cad4365b0b2dd578dd933))
+
 ## [4.2.2](https://github.com/billchurch/webssh2/compare/webssh2-server-v4.2.1...webssh2-server-v4.2.2) (2026-04-25)
 
 
